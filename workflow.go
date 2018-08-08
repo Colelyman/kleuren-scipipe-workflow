@@ -2,11 +2,11 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	sp "github.com/scipipe/scipipe"
 )
@@ -30,6 +30,9 @@ var genomePattern = flag.String("genomePattern",
 
 // Other important flags
 var kmerSize = flag.Int("k", 9, "kmer size (multiple of 9)")
+var kmerSizeString = strconv.Itoa(*kmerSize)
+var numMinColors = flag.Int("n", 0, "the number of minimum colors (for kleuren bubble finding)")
+var maxDepth = flag.Int("d", 30, "the maximum depth for kleuren to search for bubbles")
 
 // Global constant variables
 const (
@@ -64,36 +67,70 @@ func main() {
 	genomePaths := getGenomePaths()
 
 	wf := sp.NewWorkflow("kleuren", 4)
-	fmt.Println("length of genomePaths: ", len(genomePaths))
 
 	// count the kmers for each genome
 	for _, genomePath := range genomePaths {
-		fmt.Println(genomePath)
 		countKmers := wf.NewProc("countKmers"+genomePath,
-			fmt.Sprintf("%s count -m %d -s %s -o {o:jfDB} %s",
-				*jellyfishPath, *kmerSize, singleJellyfishHashSize, genomePath))
-		countKmers.SetOut("jfDB", genomePath+strconv.Itoa(*kmerSize)+".jf")
+			"{p:jfPath} count -m {p:k} -s {p:hash} -O -o {o:jfDB} {p:genome}")
+		countKmers.InParam("jfPath").FromStr(*jellyfishPath)
+		countKmers.InParam("k").FromInt(*kmerSize)
+		countKmers.InParam("hash").FromStr(singleJellyfishHashSize)
+		countKmers.InParam("genome").FromStr(genomePath)
+		countKmers.SetOut("jfDB", "{p:genome|%.fasta}.{p:k}.jf")
+
 		dumpKmers := wf.NewProc("dumpKmers"+genomePath,
-			fmt.Sprintf("%s dump -c {i:jfDB}_* -o {o:kmerCount}", *jellyfishPath))
-		dumpKmers.SetOut("kmerCount",
-			"{i:jfDB|%.fasta.jf}.kmers."+strconv.Itoa(*kmerSize)+".txt")
+			"{p:jfPath} dump -c {i:jfDB} -o {o:kmerCount}")
+		dumpKmers.InParam("jfPath").FromStr(*jellyfishPath)
+		dumpKmers.SetOut("kmerCount", "{i:jfDB|%.jf}.kmers.txt")
 
 		dumpKmers.In("jfDB").From(countKmers.Out("jfDB"))
 	}
 
-	// create the super-set of all the kmers
 	absGenomePath, _ := filepath.Abs(*genomeDir)
+
+	// create the color file
+	colorFile := wf.NewProc("colorFile", "ls {p:genomeDir}/*.{p:k}.kmers.txt > {o:colorFile}")
+	colorFile.InParam("k").FromInt(*kmerSize)
+	colorFile.InParam("genomeDir").FromStr(absGenomePath)
+	colorFile.SetOut("colorFile", "{p:genomeDir}/colors.txt")
+
+	// create the super-set of all the kmers
 	countSuperKmers := wf.NewProc("countSuperKmers",
-		fmt.Sprintf("%s count -m %d -s %s -o {o:jfDB} %s",
-			*jellyfishPath, *kmerSize, multiJellyfishHashSize, strings.Join(genomePaths, " ")))
-	countSuperKmers.SetOut("jfDB",
-		filepath.Join(absGenomePath, "super.kmers."+strconv.Itoa(*kmerSize)+".jf"))
+		"{p:jfPath} count -m {p:k} -s {p:hash} -O -o {o:jfDB} {p:genomes}")
+	countSuperKmers.InParam("jfPath").FromStr(*jellyfishPath)
+	countSuperKmers.InParam("k").FromInt(*kmerSize)
+	countSuperKmers.InParam("hash").FromStr(multiJellyfishHashSize)
+	countSuperKmers.InParam("genomes").FromStr(strings.Join(genomePaths, " "))
+	countSuperKmers.SetOut("jfDB", filepath.Join(absGenomePath, "super.kmers.{p:k}.jf"))
+
 	dumpSuperKmers := wf.NewProc("dumpSuperKmers",
-		fmt.Sprintf("%s dump -c {i:jfDB}_* -o {o:kmerCount}", *jellyfishPath))
-	dumpSuperKmers.SetOut("kmerCount",
-		filepath.Join(absGenomePath, "super.kmers."+strconv.Itoa(*kmerSize)+".txt"))
+		"{p:jfPath} dump -c {i:jfDB} -o {o:kmerCount}")
+	dumpSuperKmers.InParam("jfPath").FromStr(*jellyfishPath)
+	dumpSuperKmers.SetOut("kmerCount", "{i:jfDB|%.jf}.txt")
 
 	dumpSuperKmers.In("jfDB").From(countSuperKmers.Out("jfDB"))
+
+	// construct the BFT
+	constructBFT := wf.NewProc("bft",
+		"{p:bftPath} build {p:k} kmers {i:colorFile} {o:bftOut}")
+	constructBFT.InParam("bftPath").FromStr(*bftPath)
+	constructBFT.InParam("k").FromInt(*kmerSize)
+	constructBFT.SetOut("bftOut", filepath.Join(absGenomePath, "bft.{p:k}.out"))
+
+	constructBFT.In("colorFile").From(colorFile.Out("colorFile"))
+
+	// run kleuren
+	runKleuren := wf.NewProc("kleuren",
+		"{p:kleurenPath} -f {i:bftOut} -k {i:kmerCount} -b {o:bubblePath} -n {p:numMinColors} -d {p:maxDepth}")
+	runKleuren.InParam("kleurenPath").FromStr(*kleurenPath)
+	runKleuren.InParam("numMinColors").FromInt(*numMinColors)
+	runKleuren.InParam("maxDepth").FromInt(*maxDepth)
+	runKleuren.InParam("kmerSize").FromInt(*kmerSize)
+	runKleuren.SetOut("bubblePath", filepath.Join(absGenomePath,
+		"bubbles.kmer-{p:kmerSize}.depth-{p:maxDepth}."+time.Now().Format(time.Kitchen)+".out"))
+
+	runKleuren.In("bftOut").From(constructBFT.Out("bftOut"))
+	runKleuren.In("kmerCount").From(dumpSuperKmers.Out("kmerCount"))
 
 	// Run workflow
 	wf.Run()
